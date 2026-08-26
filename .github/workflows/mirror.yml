@@ -54,6 +54,7 @@ jobs:
           TARGET_ORG: ${{ github.event.inputs.target_org }}
           VISIBILITY: ${{ github.event.inputs.visibility }}
           MANIFEST_BRANCH: ${{ github.event.inputs.manifest_branch }}
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
         run: |
           pwd
           python3 .github/scripts/mirror_stream.py
