@@ -47,14 +47,16 @@ jobs:
       - name: repo sync
         run: |
           cd aosp-source
-          repo sync -j4 -c --force-sync
+          repo sync -j4 -c --force-sync --progress --verbose 2>&1
 
       - name: Mirror + tag each project
         env:
           TARGET_ORG: ${{ github.event.inputs.target_org }}
           VISIBILITY: ${{ github.event.inputs.visibility }}
           MANIFEST_BRANCH: ${{ github.event.inputs.manifest_branch }}
-        run: python3 .github/scripts/mirror_stream.py
+        run: |
+          pwd
+          python3 .github/scripts/mirror_stream.py
 
       - name: Push manifest repo
         env:
