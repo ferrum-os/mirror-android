@@ -1,0 +1,69 @@
+name: AOSP Froyo -> GitHub Mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: 'AOSP manifest branch/tag'
+        default: 'android-2.2_r1.1'
+      target_org:
+        description: 'Destination org/user'
+        required: true
+      visibility:
+        description: 'public or private'
+        default: 'public'
+      shallow:
+        description: 'depth=1 clone (recommended — see disk note)'
+        default: 'true'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install repo tool
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git python3 curl
+          curl https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
+          sudo chmod +x /usr/local/bin/repo
+          git config --global user.email "ci@yourdomain.example"
+          git config --global user.name "AOSP Mirror Bot"
+
+      - name: Auth GitHub CLI
+        run: |
+          echo "${{ secrets.ORG_ADMIN_TOKEN }}" | gh auth login --with-token
+          gh auth setup-git
+
+      - name: repo init
+        run: |
+          mkdir aosp-source && cd aosp-source
+          if [ "${{ github.event.inputs.shallow }}" = "true" ]; then
+            EXTRA="--depth=1"
+          else
+            EXTRA=""
+          fi
+          repo init -u https://android.googlesource.com/platform/manifest \
+            -b "${{ github.event.inputs.manifest_branch }}" $EXTRA
+
+      - name: Stream sync + mirror + tag each project
+        env:
+          TARGET_ORG: ${{ github.event.inputs.target_org }}
+          VISIBILITY: ${{ github.event.inputs.visibility }}
+          MANIFEST_BRANCH: ${{ github.event.inputs.manifest_branch }}
+        run: python3 .github/scripts/mirror_stream.py
+
+      - name: Push manifest repo
+        env:
+          TARGET_ORG: ${{ github.event.inputs.target_org }}
+        run: |
+          gh repo create "$TARGET_ORG/manifest" --${{ github.event.inputs.visibility }} -y || true
+          mkdir manifest-repo && cd manifest-repo
+          cp ../default.xml .
+          git init -b master
+          git add default.xml
+          git commit -m "AOSP ${{ github.event.inputs.manifest_branch }} manifest mirrored to GitHub"
+          git remote add origin "https://github.com/$TARGET_ORG/manifest.git"
+          git push -u origin master
