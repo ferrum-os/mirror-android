@@ -47,7 +47,7 @@ jobs:
       - name: repo sync
         run: |
           cd aosp-source
-          repo sync -j4 -c --force-sync --verbose 2>&1
+          repo sync -j4 -c --force-sync
 
       - name: Mirror + tag each project
         env:
