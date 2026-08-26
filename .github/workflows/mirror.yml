@@ -12,9 +12,6 @@ on:
       visibility:
         description: 'public or private'
         default: 'public'
-      shallow:
-        description: 'depth=1 clone (recommended — see disk note)'
-        default: 'true'
 
 jobs:
   mirror:
@@ -37,21 +34,22 @@ jobs:
           echo "${{ secrets.ORG_ADMIN_TOKEN }}" | gh auth login --with-token
           gh auth setup-git
 
-      - name: Check Disk Space
-        run: df -h
+      - name: Check disk space
+        run: df -h /
 
       - name: repo init
         run: |
-          mkdir aosp-source && cd aosp-source
-          if [ "${{ github.event.inputs.shallow }}" = "true" ]; then
-            EXTRA="--depth=1"
-          else
-            EXTRA=""
-          fi
+          mkdir aosp-source
+          cd aosp-source
           repo init -u https://android.googlesource.com/platform/manifest \
-            -b "${{ github.event.inputs.manifest_branch }}" $EXTRA
+            -b "${{ github.event.inputs.manifest_branch }}"
 
-      - name: Stream sync + mirror + tag each project
+      - name: repo sync
+        run: |
+          cd aosp-source
+          repo sync -j4 -c --force-sync
+
+      - name: Mirror + tag each project
         env:
           TARGET_ORG: ${{ github.event.inputs.target_org }}
           VISIBILITY: ${{ github.event.inputs.visibility }}
