@@ -37,6 +37,9 @@ jobs:
           echo "${{ secrets.ORG_ADMIN_TOKEN }}" | gh auth login --with-token
           gh auth setup-git
 
+      - name: Check Disk Space
+        run: df -h
+
       - name: repo init
         run: |
           mkdir aosp-source && cd aosp-source
