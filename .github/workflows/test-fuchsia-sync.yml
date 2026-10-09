@@ -1,19 +1,48 @@
 name: Fuchsia source sync size test
 
-# Tests whether a Fuchsia source checkout (bootstrap script + jiri update)
-# fits on a standard GitHub-hosted runner WITHOUT freeing any extra disk space.
-# Optionally also tries a build to see where disk/RAM/time run out.
+# Tests whether a Fuchsia source checkout fits on a standard GitHub-hosted
+# runner WITHOUT freeing extra disk space, while coping with googlesource
+# 429 / RESOURCE_EXHAUSTED rate limiting.
+#
+# It replicates what Fuchsia's `scripts/bootstrap` does (jiri bootstrap ->
+# `jiri import flower` -> `jiri update -fetch-packages-timeout=120 -hook-timeout=24`)
+# but with throttling control, backoff between rounds, and optional login.
+#
+# Optional secret: GOOGLESOURCE_GITCOOKIES (contents of a ~/.gitcookies file
+# generated at https://fuchsia.googlesource.com/new-password). Authenticated
+# requests use your account's quota instead of the shared anonymous one.
+#
 # Put this file at .github/workflows/fuchsia-sync-test.yml
 
 on:
   workflow_dispatch:
     inputs:
+      jobs:
+        description: "Parallel jiri jobs (only applied if this jiri version has a -j flag). Lower = fewer 429s"
+        default: "4"
+        required: true
+      jiri_attempts:
+        description: "jiri's own per-project retry count (only applied if supported)"
+        default: "2"
+        required: true
+      retry_rounds:
+        description: "Outer rounds of `jiri update` (it is incremental, so each round continues)"
+        default: "8"
+        required: true
+      backoff_seconds:
+        description: "Base sleep between rounds (multiplied by round number, plus jitter)"
+        default: "90"
+        required: true
+      fetch_packages:
+        description: "Download CIPD prebuilt packages (toolchains etc.). false = git repos only, if this jiri supports -fetch-packages"
+        type: boolean
+        default: true
+      use_cache:
+        description: "Save/restore the checkout with actions/cache so later runs only fetch the remainder"
+        type: boolean
+        default: false
       min_free_gb:
         description: "Abort if free disk on / drops below this many GiB"
-        default: "3"
-        required: true
-      retry_attempts:
-        description: "Times to retry a failed fetch (jiri update is incremental)"
         default: "3"
         required: true
       build_target:
@@ -36,14 +65,15 @@ jobs:
       DISK_LOG: ${{ github.workspace }}/disk.log
 
     steps:
-      # NOTE: intentionally NO disk cleanup and NO actions/checkout, so the
-      # measurement reflects the runner exactly as GitHub provides it.
+      # NOTE: intentionally NO disk cleanup, so the measurement reflects the
+      # runner exactly as GitHub provides it.
 
       - name: Baseline disk and memory state
         run: |
           echo "== df -h =="; df -h
           echo; echo "== free -h =="; free -h
           echo; echo "== nproc =="; nproc
+          echo; git --version
           BASE_USED_KB=$(df --output=used  -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
           BASE_AVAIL_KB=$(df --output=avail -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
           {
@@ -53,18 +83,50 @@ jobs:
 
       - name: Install prerequisites
         run: |
-          # The Fuchsia docs list curl, git and unzip for Linux
+          # Fuchsia docs: curl, file, git (>= 2.31) and unzip
           sudo apt-get update -y
-          sudo apt-get install -y curl git unzip
+          sudo apt-get install -y curl file git unzip
+          git --version
 
-      - name: Bootstrap Fuchsia source (with disk watchdog)
+      - name: Configure googlesource login (optional)
+        env:
+          GITCOOKIES: ${{ secrets.GOOGLESOURCE_GITCOOKIES }}
+        run: |
+          if [ -n "$GITCOOKIES" ]; then
+            umask 077
+            printf '%s\n' "$GITCOOKIES" > "$HOME/.gitcookies"
+            chmod 600 "$HOME/.gitcookies"
+            git config --global http.cookiefile "$HOME/.gitcookies"
+            echo "AUTHED=1" >> "$RESULTS"
+            echo "Using authenticated googlesource access (cookie contents are not printed)."
+          else
+            echo "AUTHED=0" >> "$RESULTS"
+            echo "No GOOGLESOURCE_GITCOOKIES secret set: using anonymous access (shared quota, more 429s)."
+          fi
+
+      - name: Restore checkout cache
+        if: ${{ inputs.use_cache }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/work/fuchsia
+          key: fuchsia-src-${{ github.run_id }}
+          restore-keys: |
+            fuchsia-src-
+
+      - name: Sync Fuchsia source (throttled, with backoff and disk watchdog)
         env:
           MIN_FREE_GB: ${{ inputs.min_free_gb }}
-          ATTEMPTS: ${{ inputs.retry_attempts }}
+          JOBS: ${{ inputs.jobs }}
+          JIRI_ATTEMPTS: ${{ inputs.jiri_attempts }}
+          ROUNDS: ${{ inputs.retry_rounds }}
+          BACKOFF: ${{ inputs.backoff_seconds }}
+          FETCH_PACKAGES: ${{ inputs.fetch_packages }}
         run: |
           set -uo pipefail
           mkdir -p "$WORK"
           cd "$WORK"
+          LOG="$WORK/jiri-update.log"
+          : > "$LOG"
 
           # ---- disk watchdog: logs usage, tracks minimum free space, aborts if too low
           MIN_FREE_KB=$(( MIN_FREE_GB * 1024 * 1024 ))
@@ -81,7 +143,6 @@ jobs:
                 echo "!! Free space below ${MIN_FREE_GB} GiB - aborting" | tee -a "$DISK_LOG"
                 touch /tmp/aborted_low_disk
                 pkill -TERM -f "jiri"      || true
-                pkill -TERM -f "bootstrap" || true
                 pkill -TERM -f "git fetch" || true
                 break
               fi
@@ -91,32 +152,68 @@ jobs:
           WATCHDOG_PID=$!
           trap 'kill $WATCHDOG_PID 2>/dev/null || true' EXIT
 
+          # small helper: retry a command with growing sleeps (for the googlesource-hosted bootstrap bits)
+          retry() {
+            local n=1 max=6
+            until "$@"; do
+              [ $n -ge $max ] && return 1
+              local s=$(( 20 * n + RANDOM % 20 ))
+              echo "retry $n/$max failed: $* ; sleeping ${s}s"
+              sleep "$s"; n=$((n+1))
+            done
+          }
+
           START=$(date +%s)
           SYNC_RC=1
 
-          # Official bootstrap script (creates ./fuchsia and downloads the source via jiri)
-          curl -fsSL "https://fuchsia.googlesource.com/fuchsia/+/HEAD/scripts/bootstrap?format=TEXT" \
-            | base64 --decode > bootstrap.sh
-          if [ ! -s bootstrap.sh ]; then
-            echo "FAILED_STAGE=download-bootstrap" >> "$RESULTS"
-            echo "SYNC_RC=1" >> "$RESULTS"
-            exit 1
+          # ---- 1. bootstrap jiri exactly like scripts/bootstrap does
+          if [ ! -x "$WORK/fuchsia/.jiri_root/bin/jiri" ]; then
+            retry bash -c 'curl -fsSL "https://fuchsia.googlesource.com/jiri/+/HEAD/scripts/bootstrap_jiri?format=TEXT" | base64 --decode > /tmp/bootstrap_jiri && test -s /tmp/bootstrap_jiri'
+            if [ $? -ne 0 ]; then
+              echo "FAILED_STAGE=download-bootstrap-jiri" >> "$RESULTS"; echo "SYNC_RC=1" >> "$RESULTS"; exit 1
+            fi
+            retry bash /tmp/bootstrap_jiri fuchsia < /dev/null
+            if [ ! -x "$WORK/fuchsia/.jiri_root/bin/jiri" ]; then
+              echo "FAILED_STAGE=bootstrap-jiri" >> "$RESULTS"; echo "SYNC_RC=1" >> "$RESULTS"; exit 1
+            fi
+          fi
+          cd "$WORK/fuchsia"
+          export PATH="$PWD/.jiri_root/bin:$PATH"
+
+          # ---- 2. import the integration manifest (once)
+          if ! grep -qs "flower" .jiri_manifest; then
+            retry jiri import -name=integration flower https://fuchsia.googlesource.com/integration < /dev/null
           fi
 
-          for attempt in $(seq 1 "$ATTEMPTS"); do
-            [ -f /tmp/aborted_low_disk ] && break
-            echo "::group::fuchsia source download, attempt $attempt"
-            if [ -x "$WORK/fuchsia/.jiri_root/bin/jiri" ]; then
-              # An earlier attempt got far enough to install jiri: continue incrementally
-              ( cd "$WORK/fuchsia" && ./.jiri_root/bin/jiri update ) < /dev/null
+          # ---- 3. only pass throttling flags this jiri version actually has
+          HELP=$(jiri help update 2>&1 || true)
+          EXTRA=()
+          if echo "$HELP" | grep -qE '^[[:space:]]*-j[= ]'; then EXTRA+=("-j=$JOBS"); fi
+          if echo "$HELP" | grep -qE '^[[:space:]]*-attempts[= ]'; then EXTRA+=("-attempts=$JIRI_ATTEMPTS"); fi
+          if [ "$FETCH_PACKAGES" = "false" ]; then
+            if echo "$HELP" | grep -qE '^[[:space:]]*-fetch-packages[= ]'; then
+              EXTRA+=("-fetch-packages=false")
             else
-              bash bootstrap.sh < /dev/null
+              echo "WARNING: this jiri has no -fetch-packages flag in its help output; packages will still download"
             fi
-            SYNC_RC=$?
+          fi
+          echo "Extra jiri update flags applied: ${EXTRA[*]:-(none found in help output)}"
+          echo "JIRI_EXTRA=${EXTRA[*]:-none}" >> "$RESULTS"
+
+          # ---- 4. jiri update in rounds; each round is incremental, so progress is kept
+          ROUNDS_USED=0
+          for round in $(seq 1 "$ROUNDS"); do
+            [ -f /tmp/aborted_low_disk ] && break
+            ROUNDS_USED=$round
+            echo "::group::jiri update, round $round"
+            jiri update -fetch-packages-timeout=120 -hook-timeout=24 "${EXTRA[@]}" < /dev/null 2>&1 | tee -a "$LOG"
+            SYNC_RC=${PIPESTATUS[0]}
             echo "::endgroup::"
             [ $SYNC_RC -eq 0 ] && break
-            echo "attempt $attempt failed (rc=$SYNC_RC)"
-            sleep 30
+            HITS=$(grep -c 'returned error: 429' "$LOG")
+            s=$(( BACKOFF * round + RANDOM % 30 ))
+            echo "round $round failed (rc=$SYNC_RC, rate-limit lines so far: $HITS). Backing off ${s}s..."
+            sleep "$s"
           done
 
           END=$(date +%s)
@@ -125,11 +222,26 @@ jobs:
           {
             echo "SYNC_RC=$SYNC_RC"
             echo "SYNC_DURATION_S=$((END-START))"
+            echo "ROUNDS_USED=$ROUNDS_USED"
+            echo "RATE_LIMIT_HITS=$(grep -c 'returned error: 429' "$LOG")"
             echo "MIN_AVAIL_KB=$(cat /tmp/min_avail_kb)"
             if [ -f /tmp/aborted_low_disk ]; then echo "ABORTED_LOW_DISK=1"; else echo "ABORTED_LOW_DISK=0"; fi
           } >> "$RESULTS"
 
           exit $SYNC_RC
+
+      - name: Save checkout cache (even after a partial sync)
+        if: ${{ always() && inputs.use_cache }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/work/fuchsia
+          key: fuchsia-src-${{ github.run_id }}
+
+      - name: Remove googlesource cookies
+        if: always()
+        run: |
+          rm -f "$HOME/.gitcookies"
+          git config --global --unset http.cookiefile || true
 
       - name: Measure source checkout
         if: always()
@@ -144,8 +256,20 @@ jobs:
           du -sh ./* ./.jiri_root 2>/dev/null | sort -rh | head -n 20 | tee /tmp/du_top.txt
           echo "DU_TREE=$(du -sh . 2>/dev/null | cut -f1)" >> "$RESULTS"
 
+          # core (git source) vs CIPD prebuilts vs third_party git deps vs jiri state
+          TOTAL_KB=$(du -sk . 2>/dev/null | cut -f1)
+          PKG_KB=$(du -sk prebuilt 2>/dev/null | cut -f1)
+          TP_KB=$(du -sk third_party 2>/dev/null | cut -f1)
+          JR_KB=$(du -sk .jiri_root 2>/dev/null | cut -f1)
+          {
+            echo "PKG_KB=${PKG_KB:-0}"
+            echo "TP_KB=${TP_KB:-0}"
+            echo "JR_KB=${JR_KB:-0}"
+            echo "CORE_KB=$(( ${TOTAL_KB:-0} - ${PKG_KB:-0} - ${TP_KB:-0} - ${JR_KB:-0} ))"
+          } >> "$RESULTS"
+
           # jiri/CIPD caches can live outside the checkout, so check common spots too
-          du -sh "$HOME/.cipd" "$HOME/.cache" "$HOME/.jiri_root" 2>/dev/null | tee /tmp/du_home.txt
+          du -sh "$HOME/.cipd" "$HOME/.cache" 2>/dev/null | tee /tmp/du_home.txt
 
       - name: Optional build attempt
         if: ${{ inputs.build_target != '' && always() }}
@@ -211,8 +335,10 @@ jobs:
           SYNC_DELTA_KB=$(( ${AFTER_SYNC_USED_KB:-0} - ${BASE_USED_KB:-0} ))
           if [ "${SYNC_RC:-1}" = "0" ] && [ "${ABORTED_LOW_DISK:-0}" = "0" ]; then
             VERDICT="SOURCE FITS"
+          elif [ "${ABORTED_LOW_DISK:-0}" = "1" ]; then
+            VERDICT="SOURCE DOES NOT FIT (ran out of disk)"
           else
-            VERDICT="SOURCE DOES NOT FIT / FAILED"
+            VERDICT="SYNC FAILED (see rate-limit hits / log; this is not a disk verdict)"
           fi
 
           {
@@ -220,10 +346,18 @@ jobs:
             echo
             echo "| Metric | Value |"
             echo "|---|---|"
+            echo "| Authenticated googlesource access | ${AUTHED:-0} |"
+            echo "| Extra jiri flags applied | \`${JIRI_EXTRA:-n/a}\` |"
+            echo "| Rounds of jiri update used | ${ROUNDS_USED:-n/a} |"
+            echo "| HTTP 429 rate-limit hits (jiri may recover from these on its own) | ${RATE_LIMIT_HITS:-n/a} |"
             echo "| Sync exit code | ${SYNC_RC:-n/a} |"
             echo "| Aborted for low disk | ${ABORTED_LOW_DISK:-n/a} |"
             echo "| Sync duration | $(( ${SYNC_DURATION_S:-0} / 60 )) min |"
             echo "| Size of checkout (du) | ${DU_TREE:-n/a} |"
+            echo "| of which core source (everything except the three rows below) | $(gib ${CORE_KB:-0}) GiB |"
+            echo "| of which \`prebuilt/\` (CIPD packages) | $(gib ${PKG_KB:-0}) GiB |"
+            echo "| of which \`third_party/\` (git dependencies) | $(gib ${TP_KB:-0}) GiB |"
+            echo "| of which \`.jiri_root\` | $(gib ${JR_KB:-0}) GiB |"
             echo "| Disk used by sync (df delta) | $(gib $SYNC_DELTA_KB) GiB |"
             echo "| Free space at start | $(gib ${BASE_AVAIL_KB:-0}) GiB |"
             echo "| Minimum free space seen | $(gib ${MIN_AVAIL_KB:-0}) GiB |"
@@ -255,8 +389,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuchsia-disk-usage-log
+          name: fuchsia-sync-logs
           path: |
             ${{ github.workspace }}/disk.log
             ${{ github.workspace }}/results.env
+            ${{ github.workspace }}/work/jiri-update.log
           if-no-files-found: ignore
