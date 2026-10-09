@@ -1,0 +1,262 @@
+name: Fuchsia source sync size test
+
+# Tests whether a Fuchsia source checkout (bootstrap script + jiri update)
+# fits on a standard GitHub-hosted runner WITHOUT freeing any extra disk space.
+# Optionally also tries a build to see where disk/RAM/time run out.
+# Put this file at .github/workflows/fuchsia-sync-test.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_free_gb:
+        description: "Abort if free disk on / drops below this many GiB"
+        default: "3"
+        required: true
+      retry_attempts:
+        description: "Times to retry a failed fetch (jiri update is incremental)"
+        default: "3"
+        required: true
+      build_target:
+        description: "OPTIONAL: product.board for `fx set` (e.g. minimal.x64). Empty = sync only."
+        default: ""
+        required: false
+      build_timeout_min:
+        description: "Time cap for the optional build, in minutes"
+        default: "120"
+        required: true
+
+jobs:
+  fuchsia-size-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # hard job limit is 360
+
+    env:
+      WORK: ${{ github.workspace }}/work
+      RESULTS: ${{ github.workspace }}/results.env
+      DISK_LOG: ${{ github.workspace }}/disk.log
+
+    steps:
+      # NOTE: intentionally NO disk cleanup and NO actions/checkout, so the
+      # measurement reflects the runner exactly as GitHub provides it.
+
+      - name: Baseline disk and memory state
+        run: |
+          echo "== df -h =="; df -h
+          echo; echo "== free -h =="; free -h
+          echo; echo "== nproc =="; nproc
+          BASE_USED_KB=$(df --output=used  -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
+          BASE_AVAIL_KB=$(df --output=avail -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
+          {
+            echo "BASE_USED_KB=$BASE_USED_KB"
+            echo "BASE_AVAIL_KB=$BASE_AVAIL_KB"
+          } > "$RESULTS"
+
+      - name: Install prerequisites
+        run: |
+          # The Fuchsia docs list curl, git and unzip for Linux
+          sudo apt-get update -y
+          sudo apt-get install -y curl git unzip
+
+      - name: Bootstrap Fuchsia source (with disk watchdog)
+        env:
+          MIN_FREE_GB: ${{ inputs.min_free_gb }}
+          ATTEMPTS: ${{ inputs.retry_attempts }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          # ---- disk watchdog: logs usage, tracks minimum free space, aborts if too low
+          MIN_FREE_KB=$(( MIN_FREE_GB * 1024 * 1024 ))
+          echo "$(df --output=avail -k / | tail -1 | tr -d ' ')" > /tmp/min_avail_kb
+          rm -f /tmp/aborted_low_disk
+          (
+            while true; do
+              avail=$(df --output=avail -k / | tail -1 | tr -d ' ')
+              used=$(df --output=used  -k / | tail -1 | tr -d ' ')
+              echo "$(date +%T) used_gb=$((used/1024/1024)) avail_gb=$((avail/1024/1024))" >> "$DISK_LOG"
+              cur_min=$(cat /tmp/min_avail_kb)
+              if [ "$avail" -lt "$cur_min" ]; then echo "$avail" > /tmp/min_avail_kb; fi
+              if [ "$avail" -lt "$MIN_FREE_KB" ]; then
+                echo "!! Free space below ${MIN_FREE_GB} GiB - aborting" | tee -a "$DISK_LOG"
+                touch /tmp/aborted_low_disk
+                pkill -TERM -f "jiri"      || true
+                pkill -TERM -f "bootstrap" || true
+                pkill -TERM -f "git fetch" || true
+                break
+              fi
+              sleep 20
+            done
+          ) &
+          WATCHDOG_PID=$!
+          trap 'kill $WATCHDOG_PID 2>/dev/null || true' EXIT
+
+          START=$(date +%s)
+          SYNC_RC=1
+
+          # Official bootstrap script (creates ./fuchsia and downloads the source via jiri)
+          curl -fsSL "https://fuchsia.googlesource.com/fuchsia/+/HEAD/scripts/bootstrap?format=TEXT" \
+            | base64 --decode > bootstrap.sh
+          if [ ! -s bootstrap.sh ]; then
+            echo "FAILED_STAGE=download-bootstrap" >> "$RESULTS"
+            echo "SYNC_RC=1" >> "$RESULTS"
+            exit 1
+          fi
+
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            [ -f /tmp/aborted_low_disk ] && break
+            echo "::group::fuchsia source download, attempt $attempt"
+            if [ -x "$WORK/fuchsia/.jiri_root/bin/jiri" ]; then
+              # An earlier attempt got far enough to install jiri: continue incrementally
+              ( cd "$WORK/fuchsia" && ./.jiri_root/bin/jiri update ) < /dev/null
+            else
+              bash bootstrap.sh < /dev/null
+            fi
+            SYNC_RC=$?
+            echo "::endgroup::"
+            [ $SYNC_RC -eq 0 ] && break
+            echo "attempt $attempt failed (rc=$SYNC_RC)"
+            sleep 30
+          done
+
+          END=$(date +%s)
+          kill $WATCHDOG_PID 2>/dev/null || true
+
+          {
+            echo "SYNC_RC=$SYNC_RC"
+            echo "SYNC_DURATION_S=$((END-START))"
+            echo "MIN_AVAIL_KB=$(cat /tmp/min_avail_kb)"
+            if [ -f /tmp/aborted_low_disk ]; then echo "ABORTED_LOW_DISK=1"; else echo "ABORTED_LOW_DISK=0"; fi
+          } >> "$RESULTS"
+
+          exit $SYNC_RC
+
+      - name: Measure source checkout
+        if: always()
+        run: |
+          set +e
+          cd "$WORK/fuchsia" 2>/dev/null || exit 0
+          echo "== df -h after sync =="; df -h "${{ github.workspace }}"
+          AFTER_USED_KB=$(df --output=used -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
+          echo "AFTER_SYNC_USED_KB=$AFTER_USED_KB" >> "$RESULTS"
+
+          echo "== du top level (largest first) =="
+          du -sh ./* ./.jiri_root 2>/dev/null | sort -rh | head -n 20 | tee /tmp/du_top.txt
+          echo "DU_TREE=$(du -sh . 2>/dev/null | cut -f1)" >> "$RESULTS"
+
+          # jiri/CIPD caches can live outside the checkout, so check common spots too
+          du -sh "$HOME/.cipd" "$HOME/.cache" "$HOME/.jiri_root" 2>/dev/null | tee /tmp/du_home.txt
+
+      - name: Optional build attempt
+        if: ${{ inputs.build_target != '' && always() }}
+        env:
+          BUILD_TARGET: ${{ inputs.build_target }}
+          BUILD_TIMEOUT_MIN: ${{ inputs.build_timeout_min }}
+          MIN_FREE_GB: ${{ inputs.min_free_gb }}
+        run: |
+          set +e
+          source "$RESULTS"
+          if [ "${SYNC_RC:-1}" != "0" ]; then
+            echo "Skipping build: source sync did not succeed"
+            echo "BUILD_RC=skipped" >> "$RESULTS"
+            exit 0
+          fi
+          cd "$WORK/fuchsia" || exit 0
+          export PATH="$WORK/fuchsia/.jiri_root/bin:$WORK/fuchsia/scripts:$PATH"
+
+          MIN_FREE_KB=$(( MIN_FREE_GB * 1024 * 1024 ))
+          rm -f /tmp/build_aborted
+          (
+            while true; do
+              avail=$(df --output=avail -k / | tail -1 | tr -d ' ')
+              echo "$(date +%T) BUILD avail_gb=$((avail/1024/1024)) mem_free_mb=$(free -m | awk '/Mem:/{print $7}')" >> "$DISK_LOG"
+              cur_min=$(cat /tmp/min_avail_kb)
+              if [ "$avail" -lt "$cur_min" ]; then echo "$avail" > /tmp/min_avail_kb; fi
+              if [ "$avail" -lt "$MIN_FREE_KB" ]; then
+                touch /tmp/build_aborted
+                pkill -TERM -f "ninja" || true
+                pkill -TERM -f "fx build" || true
+                break
+              fi
+              sleep 20
+            done
+          ) &
+          WD=$!
+
+          BSTART=$(date +%s)
+          # NOTE: `fx` setup steps can change between Fuchsia releases; check the
+          # current build docs if this stage fails for setup (not disk) reasons.
+          fx set "$BUILD_TARGET" && timeout "${BUILD_TIMEOUT_MIN}m" fx build
+          BUILD_RC=$?
+          BEND=$(date +%s)
+          kill $WD 2>/dev/null
+
+          AFTER_BUILD_USED_KB=$(df --output=used -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
+          {
+            echo "BUILD_RC=$BUILD_RC"
+            echo "BUILD_DURATION_S=$((BEND-BSTART))"
+            echo "AFTER_BUILD_USED_KB=$AFTER_BUILD_USED_KB"
+            echo "MIN_AVAIL_KB=$(cat /tmp/min_avail_kb)"
+            if [ -f /tmp/build_aborted ]; then echo "BUILD_ABORTED_LOW_DISK=1"; else echo "BUILD_ABORTED_LOW_DISK=0"; fi
+          } >> "$RESULTS"
+
+      - name: Verdict + summary
+        if: always()
+        run: |
+          set +e
+          # shellcheck disable=SC1090
+          source "$RESULTS"
+          gib() { awk -v kb="${1:-0}" 'BEGIN { printf "%.1f", kb/1024/1024 }'; }
+
+          SYNC_DELTA_KB=$(( ${AFTER_SYNC_USED_KB:-0} - ${BASE_USED_KB:-0} ))
+          if [ "${SYNC_RC:-1}" = "0" ] && [ "${ABORTED_LOW_DISK:-0}" = "0" ]; then
+            VERDICT="SOURCE FITS"
+          else
+            VERDICT="SOURCE DOES NOT FIT / FAILED"
+          fi
+
+          {
+            echo "## Fuchsia source sync size test: **$VERDICT**"
+            echo
+            echo "| Metric | Value |"
+            echo "|---|---|"
+            echo "| Sync exit code | ${SYNC_RC:-n/a} |"
+            echo "| Aborted for low disk | ${ABORTED_LOW_DISK:-n/a} |"
+            echo "| Sync duration | $(( ${SYNC_DURATION_S:-0} / 60 )) min |"
+            echo "| Size of checkout (du) | ${DU_TREE:-n/a} |"
+            echo "| Disk used by sync (df delta) | $(gib $SYNC_DELTA_KB) GiB |"
+            echo "| Free space at start | $(gib ${BASE_AVAIL_KB:-0}) GiB |"
+            echo "| Minimum free space seen | $(gib ${MIN_AVAIL_KB:-0}) GiB |"
+            if [ -n "${BUILD_RC:-}" ]; then
+              echo "| Build target | \`${{ inputs.build_target }}\` |"
+              echo "| Build exit code | ${BUILD_RC} |"
+              echo "| Build aborted for low disk | ${BUILD_ABORTED_LOW_DISK:-n/a} |"
+              echo "| Build duration | $(( ${BUILD_DURATION_S:-0} / 60 )) min |"
+              echo "| Disk used by build (df delta) | $(gib $(( ${AFTER_BUILD_USED_KB:-0} - ${AFTER_SYNC_USED_KB:-0} ))) GiB |"
+            fi
+            echo
+            echo "### Largest top-level directories"
+            echo '```'
+            cat /tmp/du_top.txt 2>/dev/null
+            echo '```'
+            echo
+            echo "<details><summary>Disk log (every 20s)</summary>"
+            echo
+            echo '```'
+            tail -n 60 "$DISK_LOG" 2>/dev/null
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Verdict: $VERDICT"
+          [ "$VERDICT" = "SOURCE FITS" ]
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuchsia-disk-usage-log
+          path: |
+            ${{ github.workspace }}/disk.log
+            ${{ github.workspace }}/results.env
+          if-no-files-found: ignore
