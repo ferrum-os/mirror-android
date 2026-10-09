@@ -1,0 +1,225 @@
+name: AOSP Android 16 shallow sync size test
+
+# Tests whether a shallow `repo sync` of Android 16 fits on a standard
+# GitHub-hosted runner WITHOUT freeing any extra disk space.
+# Put this file at .github/workflows/aosp-android16-sync-test.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: "AOSP manifest branch or tag (e.g. android-16.0.0_r1, android16-release)"
+        default: "android-16.0.0_r1"
+        required: true
+      jobs:
+        description: "Parallel sync jobs (keep low to avoid googlesource throttling)"
+        default: "6"
+        required: true
+      partial_clone:
+        description: "Also use partial clone (blob:none) on top of --depth=1"
+        type: boolean
+        default: false
+      groups:
+        description: "Optional manifest groups, e.g. 'default,-darwin' (empty = repo default)"
+        default: ""
+        required: false
+      min_free_gb:
+        description: "Abort the sync if free disk on / drops below this many GiB"
+        default: "3"
+        required: true
+
+jobs:
+  sync-size-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340 # hard job limit is 360
+
+    env:
+      AOSP_DIR: ${{ github.workspace }}/aosp
+      RESULTS: ${{ github.workspace }}/results.env
+      DISK_LOG: ${{ github.workspace }}/disk.log
+
+    steps:
+      # NOTE: intentionally NO disk cleanup and NO actions/checkout of this repo's
+      # contents, so we measure the runner exactly as GitHub hands it to us.
+
+      - name: Baseline disk state
+        run: |
+          echo "== df -h =="
+          df -h
+          echo
+          echo "== Filesystem holding the workspace =="
+          df -h "${{ github.workspace }}"
+          BASE_USED_KB=$(df --output=used -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
+          BASE_AVAIL_KB=$(df --output=avail -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
+          {
+            echo "BASE_USED_KB=$BASE_USED_KB"
+            echo "BASE_AVAIL_KB=$BASE_AVAIL_KB"
+          } > "$RESULTS"
+
+      - name: Install repo tool
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.local/bin/repo"
+          chmod +x "$HOME/.local/bin/repo"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "aosp-size-test"
+          git config --global user.email "aosp-size-test@example.invalid"
+          git config --global color.ui false
+
+      - name: Shallow repo init + sync (with disk watchdog)
+        env:
+          MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+          JOBS: ${{ inputs.jobs }}
+          PARTIAL: ${{ inputs.partial_clone }}
+          GROUPS_ARG: ${{ inputs.groups }}
+          MIN_FREE_GB: ${{ inputs.min_free_gb }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$AOSP_DIR"
+          cd "$AOSP_DIR"
+
+          # ---- disk watchdog: logs usage, tracks minimum free space, aborts if too low
+          MIN_FREE_KB=$(( MIN_FREE_GB * 1024 * 1024 ))
+          echo "$(df --output=avail -k / | tail -1 | tr -d ' ')" > /tmp/min_avail_kb
+          rm -f /tmp/aborted_low_disk
+          (
+            while true; do
+              avail=$(df --output=avail -k / | tail -1 | tr -d ' ')
+              used=$(df --output=used  -k / | tail -1 | tr -d ' ')
+              echo "$(date +%T) used_gb=$((used/1024/1024)) avail_gb=$((avail/1024/1024))" >> "$DISK_LOG"
+              cur_min=$(cat /tmp/min_avail_kb)
+              if [ "$avail" -lt "$cur_min" ]; then echo "$avail" > /tmp/min_avail_kb; fi
+              if [ "$avail" -lt "$MIN_FREE_KB" ]; then
+                echo "!! Free space below ${MIN_FREE_GB} GiB - aborting sync" | tee -a "$DISK_LOG"
+                touch /tmp/aborted_low_disk
+                pkill -TERM -f "repo sync" || true
+                pkill -TERM -f "git fetch"  || true
+                break
+              fi
+              sleep 20
+            done
+          ) &
+          WATCHDOG_PID=$!
+          trap 'kill $WATCHDOG_PID 2>/dev/null || true' EXIT
+
+          START=$(date +%s)
+
+          # ---- repo init (shallow)
+          INIT_ARGS=(-u https://android.googlesource.com/platform/manifest
+                     -b "$MANIFEST_BRANCH"
+                     --depth=1
+                     --no-clone-bundle)
+          if [ "$PARTIAL" = "true" ]; then
+            INIT_ARGS+=(--partial-clone --clone-filter=blob:none)
+          fi
+          if [ -n "$GROUPS_ARG" ]; then
+            INIT_ARGS+=(-g "$GROUPS_ARG")
+          fi
+
+          echo "::group::repo init ${INIT_ARGS[*]}"
+          repo init "${INIT_ARGS[@]}" < /dev/null
+          INIT_RC=$?
+          echo "::endgroup::"
+          if [ $INIT_RC -ne 0 ]; then
+            echo "SYNC_RC=$INIT_RC" >> "$RESULTS"
+            echo "FAILED_STAGE=init" >> "$RESULTS"
+            exit $INIT_RC
+          fi
+
+          # ---- repo sync (current branch only, no tags, shallow), retried for flaky network
+          SYNC_RC=1
+          for attempt in 1 2 3; do
+            [ -f /tmp/aborted_low_disk ] && break
+            echo "::group::repo sync attempt $attempt"
+            repo sync -c --no-tags --no-clone-bundle --optimized-fetch \
+                      --force-sync --retry-fetches=3 -j"$JOBS" < /dev/null
+            SYNC_RC=$?
+            echo "::endgroup::"
+            [ $SYNC_RC -eq 0 ] && break
+            echo "repo sync attempt $attempt failed (rc=$SYNC_RC)"
+            sleep 30
+          done
+
+          END=$(date +%s)
+          kill $WATCHDOG_PID 2>/dev/null || true
+
+          {
+            echo "SYNC_RC=$SYNC_RC"
+            echo "DURATION_S=$((END-START))"
+            echo "MIN_AVAIL_KB=$(cat /tmp/min_avail_kb)"
+            if [ -f /tmp/aborted_low_disk ]; then echo "ABORTED_LOW_DISK=1"; else echo "ABORTED_LOW_DISK=0"; fi
+          } >> "$RESULTS"
+
+          exit $SYNC_RC
+
+      - name: Measure result
+        if: always()
+        run: |
+          cd "$AOSP_DIR" 2>/dev/null || exit 0
+          echo "== df -h after sync =="
+          df -h "${{ github.workspace }}"
+          AFTER_USED_KB=$(df --output=used -k "${{ github.workspace }}" | tail -1 | tr -d ' ')
+          echo "AFTER_USED_KB=$AFTER_USED_KB" >> "$RESULTS"
+
+          echo "== du .repo =="
+          du -sh .repo 2>/dev/null | tee /tmp/du_repo.txt || true
+          echo "== du whole tree =="
+          du -sh . 2>/dev/null | tee /tmp/du_tree.txt || true
+          echo "PROJECT_COUNT=$(repo list 2>/dev/null | wc -l)" >> "$RESULTS"
+          echo "DU_REPO=$(cut -f1 /tmp/du_repo.txt 2>/dev/null)" >> "$RESULTS"
+          echo "DU_TREE=$(cut -f1 /tmp/du_tree.txt 2>/dev/null)" >> "$RESULTS"
+
+      - name: Verdict + summary
+        if: always()
+        run: |
+          set +e
+          # shellcheck disable=SC1090
+          source "$RESULTS"
+
+          gib() { awk -v kb="${1:-0}" 'BEGIN { printf "%.1f", kb/1024/1024 }'; }
+
+          USED_DELTA_KB=$(( ${AFTER_USED_KB:-0} - ${BASE_USED_KB:-0} ))
+          if [ "${SYNC_RC:-1}" = "0" ] && [ "${ABORTED_LOW_DISK:-0}" = "0" ]; then
+            VERDICT="FITS"
+          else
+            VERDICT="DOES NOT FIT / FAILED"
+          fi
+
+          {
+            echo "## AOSP shallow sync size test: **$VERDICT**"
+            echo
+            echo "| Metric | Value |"
+            echo "|---|---|"
+            echo "| Manifest branch/tag | \`${{ inputs.manifest_branch }}\` |"
+            echo "| Partial clone | ${{ inputs.partial_clone }} |"
+            echo "| Manifest groups | \`${{ inputs.groups }}\` |"
+            echo "| Sync exit code | ${SYNC_RC:-n/a} |"
+            echo "| Aborted for low disk | ${ABORTED_LOW_DISK:-n/a} |"
+            echo "| Duration | $(( ${DURATION_S:-0} / 60 )) min |"
+            echo "| Projects synced | ${PROJECT_COUNT:-n/a} |"
+            echo "| Size of \`.repo\` | ${DU_REPO:-n/a} |"
+            echo "| Size of full tree | ${DU_TREE:-n/a} |"
+            echo "| Disk used by sync (df delta) | $(gib $USED_DELTA_KB) GiB |"
+            echo "| Free space at start | $(gib ${BASE_AVAIL_KB:-0}) GiB |"
+            echo "| Minimum free space seen | $(gib ${MIN_AVAIL_KB:-0}) GiB |"
+            echo
+            echo "<details><summary>Disk log (every 20s)</summary>"
+            echo
+            echo '```'
+            tail -n 60 "$DISK_LOG" 2>/dev/null
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Verdict: $VERDICT"
+          [ "$VERDICT" = "FITS" ]
+
+      - name: Upload disk log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk-usage-log
+          path: |
+            ${{ github.workspace }}/disk.log
+            ${{ github.workspace }}/results.env
+          if-no-files-found: ignore
