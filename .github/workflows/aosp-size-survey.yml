@@ -1,0 +1,324 @@
+name: AOSP per-project size survey
+
+# Measures how big every project in an AOSP manifest is, WITHOUT checking the
+# whole tree out. Each project is shallow-fetched into a temp dir, sized
+# (sum of blob sizes at the tag + pack size on disk), then deleted.
+# Output: totals per group filter, per top-level directory, the largest
+# projects, and a suggested <remove-project> local manifest to fit a budget.
+# Put this file at .github/workflows/aosp-size-survey.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: "Manifest branch or tag"
+        default: "android-16.0.0_r1"
+        required: true
+      jobs:
+        description: "Parallel fetches (lower if googlesource throttles you)"
+        default: "8"
+        required: true
+      group_filter:
+        description: "repo -g style filter to analyse in detail (e.g. 'pdk,-notdefault', 'default')"
+        default: "pdk,-notdefault"
+        required: true
+      budget_gb:
+        description: "Target total size (GiB) for the cut suggestion"
+        default: "70"
+        required: true
+      protect_regex:
+        description: "Python regex of project PATHS that must never be suggested for removal"
+        default: "^(build/|bionic$|system/core$)"
+        required: false
+
+jobs:
+  survey:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    env:
+      WORK: ${{ github.workspace }}/aosp
+      OUT_DIR: ${{ github.workspace }}/survey-out
+
+    steps:
+      - name: Baseline disk state
+        run: |
+          df -h
+          free -h
+
+      - name: Install repo tool and fetch manifest only
+        env:
+          BRANCH: ${{ inputs.manifest_branch }}
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.local/bin/repo"
+          chmod +x "$HOME/.local/bin/repo"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          git config --global user.name  "aosp-size-survey"
+          git config --global user.email "aosp-size-survey@example.invalid"
+          git config --global color.ui false
+          mkdir -p "$WORK" && cd "$WORK"
+          # init only: this downloads the manifest repo, NOT the source tree
+          repo init -u https://android.googlesource.com/platform/manifest \
+                    -b "$BRANCH" --depth=1 --no-clone-bundle < /dev/null
+          ls -l .repo/manifests/default.xml
+
+      - name: Write survey script
+        run: |
+          cat > "${{ github.workspace }}/survey.py" <<'PY'
+          #!/usr/bin/env python3
+          import csv, os, re, shutil, subprocess, sys, tempfile, time
+          import xml.etree.ElementTree as ET
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.parse import urljoin
+
+          MANIFEST = os.environ["MANIFEST_XML"]
+          MANIFEST_URL = os.environ["MANIFEST_URL"]
+          JOBS = int(os.environ.get("JOBS", "8"))
+          BUDGET = float(os.environ.get("BUDGET_GB", "70")) * 2**30
+          SPEC = os.environ.get("GROUP_FILTER", "pdk,-notdefault")
+          PROTECT = re.compile(os.environ.get("PROTECT_REGEX") or r"^$")
+          OUT = os.environ["OUT_DIR"]
+          SUMMARY = os.environ["SUMMARY_FILE"]
+          TMP = "/tmp/survey"
+          os.makedirs(TMP, exist_ok=True)
+          os.makedirs(OUT, exist_ok=True)
+          GENV = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+
+          def load():
+              root = ET.parse(MANIFEST).getroot()
+              remotes = {r.get("name"): r for r in root.findall("remote")}
+              dflt = root.find("default")
+              out = []
+              for p in root.findall("project"):
+                  name = p.get("name")
+                  path = p.get("path") or name
+                  rem = remotes[p.get("remote") or dflt.get("remote")]
+                  base = urljoin(MANIFEST_URL, rem.get("fetch"))
+                  if not base.endswith("/"):
+                      base += "/"
+                  rev = p.get("revision") or rem.get("revision") or dflt.get("revision")
+                  if not re.fullmatch(r"[0-9a-f]{40}", rev) and not rev.startswith("refs/"):
+                      rev = "refs/heads/" + rev
+                  groups = [g for g in (p.get("groups") or "").split(",") if g]
+                  out.append(dict(name=name, path=path, url=base + name, rev=rev, groups=groups))
+              return out
+
+
+          def dir_bytes(d):
+              tot = 0
+              for r, _, fs in os.walk(d):
+                  for f in fs:
+                      try:
+                          tot += os.lstat(os.path.join(r, f)).st_blocks * 512
+                      except OSError:
+                          pass
+              return tot
+
+
+          def measure(p):
+              d = tempfile.mkdtemp(dir=TMP)
+              res = dict(p, files=0, logical=0, disk=0, pack=0, err="")
+              try:
+                  subprocess.run(["git", "init", "-q", "--bare", d], check=True, env=GENV)
+                  ok = False
+                  for attempt in range(1, 5):
+                      r = subprocess.run(
+                          ["git", "-C", d, "fetch", "-q", "--depth=1", "--no-tags", p["url"], p["rev"]],
+                          capture_output=True, text=True, env=GENV)
+                      if r.returncode == 0:
+                          ok = True
+                          break
+                      res["err"] = r.stderr.strip()[-200:]
+                      time.sleep(5 * attempt)
+                  if not ok:
+                      return res
+                  res["err"] = ""
+                  ls = subprocess.run(["git", "-C", d, "ls-tree", "-r", "-l", "-z", "FETCH_HEAD"],
+                                      capture_output=True, env=GENV)
+                  if ls.returncode != 0:
+                      res["err"] = "ls-tree: " + ls.stderr.decode(errors="replace")[-200:]
+                      return res
+                  for ent in ls.stdout.split(b"\0"):
+                      if not ent:
+                          continue
+                      meta = ent.split(b"\t", 1)[0].split()
+                      if len(meta) < 4 or meta[1] != b"blob":
+                          continue
+                      sz = int(meta[3])
+                      res["files"] += 1
+                      res["logical"] += sz
+                      res["disk"] += (sz + 4095) // 4096 * 4096
+                  res["pack"] = dir_bytes(d)
+                  return res
+              finally:
+                  shutil.rmtree(d, ignore_errors=True)
+
+
+          def matches(p, spec):
+              """Same matching rules as `repo init -g`."""
+              mg = [t for t in spec.split(",") if t] or ["default"]
+              pg = ["all"] + p["groups"] + ["name:" + p["name"], "path:" + p["path"]]
+              if "notdefault" not in p["groups"]:
+                  pg.append("default")
+              m = False
+              for g in mg:
+                  if g.startswith("-") and g[1:] in pg:
+                      m = False
+                  elif g in pg:
+                      m = True
+              return m
+
+
+          def est(r):
+              return r["disk"] + r["pack"]
+
+
+          def gib(b):
+              return f"{b / 2**30:.1f}"
+
+
+          def topkey(path):
+              p = path.split("/")
+              if p[0] in ("prebuilts", "device", "hardware", "packages", "frameworks", "tools") and len(p) > 1:
+                  return p[0] + "/" + p[1]
+              if p[0] == "kernel" and len(p) > 2:
+                  return "/".join(p[:3])
+              return p[0]
+
+
+          projs = load()
+          print(f"{len(projs)} projects; first URL: {projs[0]['url']} @ {projs[0]['rev']}", flush=True)
+
+          rows = []
+          with ThreadPoolExecutor(JOBS) as ex:
+              futs = [ex.submit(measure, p) for p in projs]
+              for i, f in enumerate(as_completed(futs), 1):
+                  rows.append(f.result())
+                  if i % 50 == 0 or i == len(futs):
+                      print(f"{i}/{len(futs)} measured", flush=True)
+          rows.sort(key=lambda r: r["path"])
+
+          with open(os.path.join(OUT, "projects.csv"), "w", newline="") as fh:
+              w = csv.writer(fh)
+              w.writerow(["path", "name", "groups", "files", "logical_bytes",
+                          "worktree_disk_bytes", "pack_bytes", "est_total_bytes", "error"])
+              for r in rows:
+                  w.writerow([r["path"], r["name"], ",".join(r["groups"]), r["files"], r["logical"],
+                              r["disk"], r["pack"], est(r), r["err"]])
+
+          failed = [r for r in rows if r["err"]]
+          L = []
+          L.append("## AOSP per-project size survey")
+          L.append("")
+          L.append(f"Projects in manifest: **{len(rows)}**, failed to measure: **{len(failed)}**")
+          L.append("")
+          L.append("Estimated disk = worktree (4 KiB-rounded) + one shallow pack copy in `.repo`. "
+                   "Real syncs can differ a bit, so confirm with an actual sync of the final set.")
+          L.append("")
+          L.append("### Totals per group filter")
+          L.append("")
+          L.append("| Filter (`repo init -g`) | Projects | Worktree GiB | Pack GiB | Est. total GiB |")
+          L.append("|---|---|---|---|---|")
+          specs = []
+          for s in ["", "all", "pdk", "pdk,-notdefault", SPEC]:
+              if s not in specs:
+                  specs.append(s)
+          for s in specs:
+              sel = [r for r in rows if matches(r, s)]
+              L.append(f"| `{s or '(default)'}` | {len(sel)} | {gib(sum(r['disk'] for r in sel))} | "
+                       f"{gib(sum(r['pack'] for r in sel))} | **{gib(sum(est(r) for r in sel))}** |")
+
+          sel = [r for r in rows if matches(r, SPEC)]
+          total = sum(est(r) for r in sel)
+
+          L.append("")
+          L.append(f"### Breakdown for `{SPEC}` by directory")
+          L.append("")
+          L.append("| Directory | Projects | Est. GiB |")
+          L.append("|---|---|---|")
+          agg = {}
+          for r in sel:
+              k = topkey(r["path"])
+              c, s_ = agg.get(k, (0, 0))
+              agg[k] = (c + 1, s_ + est(r))
+          for k, (c, s_) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:25]:
+              L.append(f"| `{k}` | {c} | {gib(s_)} |")
+
+          L.append("")
+          L.append(f"### 40 largest projects in `{SPEC}`")
+          L.append("")
+          L.append("| Path | Est. GiB | Files |")
+          L.append("|---|---|---|")
+          for r in sorted(sel, key=est, reverse=True)[:40]:
+              L.append(f"| `{r['path']}` | {gib(est(r))} | {r['files']} |")
+
+          # greedy cut suggestion
+          cands = sorted([r for r in sel if not PROTECT.search(r["path"])], key=est, reverse=True)
+          removed, cur = [], total
+          for r in cands:
+              if cur <= BUDGET:
+                  break
+              removed.append(r)
+              cur -= est(r)
+
+          L.append("")
+          L.append(f"### Cut suggestion to fit {gib(BUDGET)} GiB")
+          L.append("")
+          if total <= BUDGET:
+              L.append(f"`{SPEC}` is already about {gib(total)} GiB, within budget. No cuts needed.")
+          else:
+              L.append(f"Starting from {gib(total)} GiB, removing the {len(removed)} largest non-protected "
+                       f"projects gets the estimate to about **{gib(cur)} GiB**"
+                       + ("" if cur <= BUDGET else " (still over budget: protected projects alone are too big)")
+                       + ".")
+              L.append("")
+              L.append("Copy `local_manifest.xml` from the artifact to `.repo/local_manifests/` after "
+                       "`repo init`, before `repo sync`.")
+              L.append("")
+              L.append("| Removed project | Est. GiB |")
+              L.append("|---|---|")
+              for r in removed[:60]:
+                  L.append(f"| `{r['path']}` | {gib(est(r))} |")
+              if len(removed) > 60:
+                  L.append(f"| ... and {len(removed) - 60} more (see local_manifest.xml) | |")
+
+          with open(os.path.join(OUT, "local_manifest.xml"), "w") as fh:
+              fh.write('<?xml version="1.0" encoding="UTF-8"?>\n<manifest>\n')
+              for r in removed:
+                  fh.write(f'  <remove-project name="{r["name"]}" />\n')
+              fh.write("</manifest>\n")
+
+          if failed:
+              L.append("")
+              L.append("### Projects that failed to measure (not counted above)")
+              L.append("")
+              for r in failed[:15]:
+                  L.append(f"- `{r['path']}`: {r['err'][:120]}")
+
+          with open(SUMMARY, "a") as fh:
+              fh.write("\n".join(L) + "\n")
+          print("\n".join(L))
+          PY
+
+      - name: Run survey
+        env:
+          MANIFEST_XML: ${{ github.workspace }}/aosp/.repo/manifests/default.xml
+          MANIFEST_URL: https://android.googlesource.com/platform/manifest
+          JOBS: ${{ inputs.jobs }}
+          BUDGET_GB: ${{ inputs.budget_gb }}
+          GROUP_FILTER: ${{ inputs.group_filter }}
+          PROTECT_REGEX: ${{ inputs.protect_regex }}
+        run: |
+          export SUMMARY_FILE="$GITHUB_STEP_SUMMARY"
+          python3 "${{ github.workspace }}/survey.py"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aosp-size-survey
+          path: ${{ github.workspace }}/survey-out/
+          if-no-files-found: ignore
